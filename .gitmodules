@@ -1,3 +1,0 @@
-[submodule "spl"]
-	path = spl
-	url = git@gitlab.com:jflournoy/spl.git
