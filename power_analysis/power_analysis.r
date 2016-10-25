@@ -1,37 +1,169 @@
-install.packages('ndl')
 library(ndl)
-
-data(lexample)
-
 library(tidyr)
 library(dplyr)
+library(parallel)
+library(lme4)
+library(MASS)
+library(ggplot2)
+library(knitr)
 
-somedata <- read.csv('~/code/socprobmisc/split-130-1468342589910.csv')
+Simulate <- function(k, n, icc, beta, X=NA, sigma=NA, sigmaXre=NA){
+    #k is number of groups
+    #n is observations per group
+    #icc is the population interclass-correlation
+    #beta is the vector of fixed effect parameter weights
+    #X, if provided, should not include the intercept, and should first
+    # rotate observations within-group, then between
+    #sigma is the covariance matrix of the fixed effect variables
+    #sigmaXre is the covariance matrix of the random effects where 0 indicates no RE
+    require(MASS)
+    nk <- n*k
+    nx <- length(beta)-1
+    Z <- kronecker(diag(k), rep(1,n))
+#
+    if(is.na(X[1])){ #no X matrix provided
+        # X matrix
+        if (is.na(sigma[1])) sigma <- diag(nx)
+        X <- mvrnorm(nk, rep(0,nx), sigma)
+        userX <- FALSE
+    } else {
+        #check that that X matrix is correct size
+        if(dim(X)[1] != nk) stop('X matrix is not correct length (n*k)')
+        if(dim(X)[2] != length(beta)-1) stop('X matrix is correct width (length(betas)-1)')
+        userX <- TRUE
+    }
+#
+    # random effects of X
+    if (!is.na(sigmaXre[1])){
+        Xre <- t(matrix(rnorm(k*nx,rep(1,nx),sigmaXre),nrow=nx))
+        Xre <- cbind(rep(1,nk), X * (Z %*% Xre))
+    } else {
+        Xre <- cbind(rep(1,nk), X)
+    }
+    X <- cbind(rep(1,nk), X)
+#
+    # create a factor to keep track of which “students” are in which “school”
+    group <- as.factor(rep(1:k, each=n))
+#
+    # generate taus and epsilons
+    tecov <- diag(c(icc, rep(1-icc,n)))
+    te <- mvrnorm(k, rep(0,n+1), tecov)
+    epsilons <- as.vector(t(te[,-1]))
+    taus <- te[,1]
+#
+    # generate Y data
+    ran <- Z %*% taus + epsilons
+    Y <- Xre %*% beta + ran
+#
+    output <- as.data.frame(X[,-1])
+    output$Y <- Y
+    output$group <- group
+    return(output)
+}
+simAnalysis <- function(simParams, agerange){
+    N <- as.numeric(length(agerange)*simParams[['NperAge']]) 
+    icc <- as.numeric(simParams[['icc']])
+    condition <- factor(c('social','status','mateseek'), levels=c('social','status','mateseek'))
+    age <- rep(agerange-mean(agerange), each=N/length(agerange))
+    simDF <- as.data.frame(expand.grid(condition=condition,age=age))
+    aModMat <- model.matrix(~condition*age, data=simDF)
+    FEbetas <- as.numeric(simParams[1:6])
+    FEsigma <- diag(length(FEbetas))
+    REsigma <- matrix(rep(0,(length(FEbetas)-1)^2), length(FEbetas)-1)
 
-justthefacts <- somedata %>% filter(stimulus != '') %>%
-	extract(stimulus, c('image_file', 'left', 'right'), '.*([fm]_f42887.*png).*left>(\\w+)</div>.*right>(\\w+)</div>') %>% 
-	select(image_file, left, right, optimal_response, correct_response)
+    mlm_sim_output <- Simulate(k=N, n=3, icc=icc, beta=FEbetas,
+                               X=aModMat[,-1], sigma=FEsigma, sigmaXre=REsigma)
+    simDF$alphaExp <- mlm_sim_output$Y
+    simDF$group <- mlm_sim_output$group
 
-table(justthefacts$image_file, justthefacts$correct_response)
+    modAgeCond <- lmer(alphaExp~1+condition+age+(1|group), data=simDF, REML=F) 
+    modAgeCondX <- lmer(alphaExp~1+condition*age+(1|group), data=simDF, REML=F)
+    modComp <- anova(modAgeCond, modAgeCondX)[,c(1,2,3,5)] 
+    modCompSum <- (modComp[1,]-modComp[2,])
+    return(bind_cols(as.data.frame(simParams), modCompSum))
+}
+
+simAnalysisReplications <- function(simParams, agerange, n=1){
+    #run n replications of a particular simulated analysis using simAnalysis
+    return(replicate(n, simAnalysis(simParams,  agerange=agerange), simplify=F))
+}
+
+agerange <- 11:22
+NperAge <- c(4, 8, seq(10,20,2))
+Niter <- 500
+b0 <- 0
+b1.stat <- c(0, .3, -.3)
+b2.mate <- b1.stat
+b3.age <- b1.stat
+b4.statXage <- c(0, .1, -.1) 
+b5.mateXage <- c(0, .1, -.1) 
+icc <- c(.25, .5, .75)
+
+simParams <- as.data.frame(expand.grid(b0, b1.stat, b2.mate, b3.age, b4.statXage, b5.mateXage, NperAge, icc))
+names(simParams) <- c('b0', 'b1.stat', 'b2.mate', 'b3.age', 'b4.statXage', 'b5.mateXage', 'NperAge', 'icc') 
+
+simParamList <- split(simParams, 1:dim(simParams)[1])
+
+if(!file.exists('simRezDF.RDS')){
+    sometime <- system.time({test <- simAnalysisReplications(simParamList[[1]], agerange=agerange, n=Niter)})
+
+    print(paste0("estimated time is ",
+                 sometime[1]*length(simParamList)/60/8,
+                 " mins")) 
+    (someMoreTime <- system.time({
+        cl <- makeCluster(8) 
+        simResults <- mclapply(simParamList, simAnalysisReplications, 
+                               agerange=agerange, n=Niter,
+                               mc.cores=8)
+        stopCluster(cl)
+    }))
+    simRezDF <- as_data_frame(bind_rows(unlist(simResults, recursive=F)))
+    saveRDS(simRezDF, 'simRezDF.RDS')
+} else {
+    simRezDF <- readRDS('simRezDF.RDS')
+}
 
 
-#Well, that's exciting. SON OF A
-data.frame(table(justthefacts$image_file, justthefacts$correct_response)) %>%
-	spread(Var2, Freq) %>%
-	rowwise() %>%
-	mutate(prop37 = `37`/(`37`+`39`),
-	       prop39 = `39`/(`37`+`39`))
+simRezSummary <- simRezDF %>%
+    mutate(p=pchisq(deviance, df=abs(Df), lower.tail=F)) %>%
+    group_by(b0, b1.stat,b2.mate,b3.age,b4.statXage,b5.mateXage,NperAge,icc) %>%
+    summarize(power=mean(p<.05),
+              n=n(),
+              powerse=sqrt(power*(1-power)/Niter),
+              power_u=power+1.96*powerse,
+              power_l=power-1.95*powerse) %>% ungroup %>%
+    mutate(n=NperAge*length(agerange))
 
-orthoCoding(lexample$Word, grams=1)
+simRezSummary %>%
+    filter(b4.statXage != 0 & b5.mateXage !=0) %>%
+    group_by(n, icc) %>%
+    summarize(min_power=min(power),
+              mean_power=mean(power)) %>% kable(digits=2, format='markdown')
 
-splitCues <- data.frame(Cues=rep(c('h_t_z', 'h_t_y', 
-				   'd_l_x', 'd_l_w', 
-				   'p_n_v', 'p_n_u'), each=2),
-			Outcomes=c(rep(c('hungry','thirsty'), 2),
-				   rep(c('dating','looking'), 2),
-				   rep(c('popular', 'unpopular'), 2)),
-			Frequency=rep(c(51, 13, 13, 51), 3),
-			stringsAsFactors = F)
 
-rw.test <- RescorlaWagner(splitCues, nruns=1, traceCue='z', traceOutcome='thirsty')
-plot(rw.test)
+#+fig.width=4, fig.height=8, device='png', dpi=72, warning=F, message=F  
+nada <- simRezSummary %>%
+    ungroup() %>%
+    do({
+        plot <- filter(., icc==.25, b3.age==0, b1.stat==0, b2.mate==0) %>%
+            mutate(b5.mateXage=paste0('Mate x Age: ', b5.mateXage)) %>%
+            ggplot(aes(x=n, y=power, group=b4.statXage, color=factor(b4.statXage)))+
+            geom_hline(yintercept=.8, color='gray', size=.5, alpha=.5)+
+            geom_hline(yintercept=.95, color='gray', size=.5, alpha=.5)+
+            geom_hline(yintercept=.05, color='gray', size=.5, alpha=.5)+
+            geom_vline(xintercept=160, color='gray', size=.5, alpha=.5)+
+            geom_smooth(method='glm', method.args=list(family='binomial'), se=F)+
+            geom_errorbar(aes(ymin=power_l, ymax=power_u), position=position_dodge(w=10), width=0)+
+            geom_point(position=position_dodge(w=10))+
+            facet_grid(b5.mateXage~.)+
+            labs(title=paste0('Estimated power to detect\ninteraction effects\n',
+                              '(simulations-per-point=500)'),
+                 color='Status x Age')+
+            theme(legend.position="top", panel.background=element_rect(fill='#ffffff'))+
+            scale_y_continuous(breaks=c(0, .05, .8, .95, 1))+
+            scale_x_continuous(breaks=seq(0,280,40))
+        print(plot)
+        data_frame(plot=list(plot))
+    }) 
+
+ggsave(nada$plot[[1]], filename='power_plot.png', width=3, height=8, units='in', dpi=300)
